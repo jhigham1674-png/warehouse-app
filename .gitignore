@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+warehouse_logging_2.db
+venv/
+.env/
