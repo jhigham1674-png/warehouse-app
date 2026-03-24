@@ -1,5 +1,4 @@
 from flask import Flask, request, redirect, url_for, render_template_string, session
-import sqlite3
 from datetime import datetime
 import json
 import html
@@ -7,11 +6,15 @@ import csv
 import io
 import os
 from functools import wraps
+
+import psycopg2
+import psycopg2.extras
 from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "change-this-secret-key")
-DB_NAME = os.environ.get("DB_NAME", "warehouse_logging_2.db")
+DATABASE_URL = os.environ.get("DATABASE_URL")
+
 
 BASE_HTML = """
 <!doctype html>
@@ -412,139 +415,138 @@ def now_str():
 
 
 def get_db_connection():
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    return conn
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not set.")
+    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
 
 
-def table_exists(conn, table_name):
-    row = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
-        (table_name,)
-    ).fetchone()
-    return row is not None
-
-
-def column_exists(conn, table_name, column_name):
-    if not table_exists(conn, table_name):
-        return False
-    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
-    return any(row["name"] == column_name for row in rows)
-
-
-def ensure_column(conn, table_name, column_name, column_sql):
-    if not column_exists(conn, table_name, column_name):
-        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_sql}")
+def execute(query, params=None, fetchone=False, fetchall=False, commit=False):
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute(query, params or ())
+        result = None
+        if fetchone:
+            result = cur.fetchone()
+        elif fetchall:
+            result = cur.fetchall()
+        if commit:
+            conn.commit()
+        cur.close()
+        return result
+    finally:
+        conn.close()
 
 
 def init_db():
     conn = get_db_connection()
+    try:
+        cur = conn.cursor()
 
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            full_name TEXT NOT NULL
-        )
-    """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                full_name TEXT NOT NULL,
+                access_level INTEGER NOT NULL DEFAULT 1
+            )
+        """)
 
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS products (
-            sku TEXT PRIMARY KEY,
-            description TEXT NOT NULL
-        )
-    """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS products (
+                sku TEXT PRIMARY KEY,
+                description TEXT NOT NULL
+            )
+        """)
 
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS pallets (
-            pallet_number INTEGER PRIMARY KEY,
-            pallet_name TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )
-    """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS pallets (
+                pallet_number INTEGER PRIMARY KEY,
+                pallet_name TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                created_by TEXT
+            )
+        """)
 
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS pallet_items (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            pallet_number INTEGER NOT NULL,
-            sku TEXT NOT NULL,
-            description TEXT NOT NULL,
-            quantity INTEGER NOT NULL,
-            FOREIGN KEY (pallet_number) REFERENCES pallets (pallet_number)
-        )
-    """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS pallet_items (
+                id SERIAL PRIMARY KEY,
+                pallet_number INTEGER NOT NULL,
+                sku TEXT NOT NULL,
+                description TEXT NOT NULL,
+                quantity INTEGER NOT NULL,
+                FOREIGN KEY (pallet_number) REFERENCES pallets (pallet_number) ON DELETE CASCADE
+            )
+        """)
 
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS pallet_audit (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            pallet_number INTEGER,
-            action_type TEXT NOT NULL,
-            username TEXT NOT NULL,
-            details TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )
-    """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS pallet_audit (
+                id SERIAL PRIMARY KEY,
+                pallet_number INTEGER,
+                action_type TEXT NOT NULL,
+                username TEXT NOT NULL,
+                details TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+        """)
 
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS audit_runs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            audit_name TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            created_by TEXT NOT NULL,
-            is_closed INTEGER NOT NULL DEFAULT 0
-        )
-    """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS audit_runs (
+                id SERIAL PRIMARY KEY,
+                audit_name TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                created_by TEXT NOT NULL,
+                is_closed BOOLEAN NOT NULL DEFAULT FALSE
+            )
+        """)
 
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS audit_run_items (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            audit_run_id INTEGER NOT NULL,
-            pallet_number INTEGER NOT NULL,
-            confirmed_at TEXT NOT NULL,
-            confirmed_by TEXT NOT NULL,
-            UNIQUE(audit_run_id, pallet_number),
-            FOREIGN KEY (audit_run_id) REFERENCES audit_runs(id)
-        )
-    """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS audit_run_items (
+                id SERIAL PRIMARY KEY,
+                audit_run_id INTEGER NOT NULL,
+                pallet_number INTEGER NOT NULL,
+                confirmed_at TEXT NOT NULL,
+                confirmed_by TEXT NOT NULL,
+                UNIQUE(audit_run_id, pallet_number),
+                FOREIGN KEY (audit_run_id) REFERENCES audit_runs(id) ON DELETE CASCADE
+            )
+        """)
 
-    ensure_column(conn, "users", "access_level", "INTEGER NOT NULL DEFAULT 1")
-    ensure_column(conn, "pallets", "created_by", "TEXT")
+        cur.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS access_level INTEGER NOT NULL DEFAULT 1")
+        cur.execute("ALTER TABLE pallets ADD COLUMN IF NOT EXISTS created_by TEXT")
 
-    conn.execute("UPDATE users SET access_level = 1 WHERE access_level IS NULL")
-    conn.execute("UPDATE users SET access_level = 3 WHERE username = 'admin'")
-    conn.execute("UPDATE pallets SET created_by = 'Unknown' WHERE created_by IS NULL")
+        cur.execute("UPDATE users SET access_level = 1 WHERE access_level IS NULL")
+        cur.execute("UPDATE users SET access_level = 3 WHERE username = 'admin'")
+        cur.execute("UPDATE pallets SET created_by = 'Unknown' WHERE created_by IS NULL")
 
-    seed_users = [
-        ("admin", generate_password_hash("admin123"), "Owner", 3),
-        ("warehouse", generate_password_hash("warehouse123"), "Warehouse User", 1),
-    ]
+        seed_users = [
+            ("admin", generate_password_hash("admin123"), "Owner", 3),
+            ("warehouse", generate_password_hash("warehouse123"), "Warehouse User", 1),
+        ]
 
-    for username, password_hash, full_name, access_level in seed_users:
-        existing = conn.execute(
-            "SELECT id FROM users WHERE username = ?",
-            (username,)
-        ).fetchone()
-        if not existing:
-            conn.execute("""
-                INSERT INTO users (username, password_hash, full_name, access_level)
-                VALUES (?, ?, ?, ?)
-            """, (username, password_hash, full_name, access_level))
+        for username, password_hash, full_name, access_level in seed_users:
+            cur.execute("SELECT id FROM users WHERE username = %s", (username,))
+            existing = cur.fetchone()
+            if not existing:
+                cur.execute("""
+                    INSERT INTO users (username, password_hash, full_name, access_level)
+                    VALUES (%s, %s, %s, %s)
+                """, (username, password_hash, full_name, access_level))
 
-    conn.commit()
-    conn.close()
+        conn.commit()
+        cur.close()
+    finally:
+        conn.close()
 
 
 def log_audit(action_type, details, pallet_number=None):
     if not session.get("username"):
         return
-    conn = get_db_connection()
-    conn.execute("""
+    execute("""
         INSERT INTO pallet_audit (pallet_number, action_type, username, details, created_at)
-        VALUES (?, ?, ?, ?, ?)
-    """, (pallet_number, action_type, session["username"], details, now_str()))
-    conn.commit()
-    conn.close()
+        VALUES (%s, %s, %s, %s, %s)
+    """, (pallet_number, action_type, session["username"], details, now_str()), commit=True)
 
 
 def render_page(content, title="Warehouse Logging 2"):
@@ -580,21 +582,12 @@ def level_required(required_level):
 
 
 def get_product_map():
-    conn = get_db_connection()
-    rows = conn.execute("SELECT sku, description FROM products ORDER BY sku").fetchall()
-    conn.close()
-    return {
-        row["sku"]: {
-            "description": row["description"]
-        }
-        for row in rows
-    }
+    rows = execute("SELECT sku, description FROM products ORDER BY sku", fetchall=True)
+    return {row["sku"]: {"description": row["description"]} for row in rows}
 
 
 def get_used_pallet_numbers():
-    conn = get_db_connection()
-    rows = conn.execute("SELECT pallet_number FROM pallets ORDER BY pallet_number").fetchall()
-    conn.close()
+    rows = execute("SELECT pallet_number FROM pallets ORDER BY pallet_number", fetchall=True)
     return {row["pallet_number"] for row in rows}
 
 
@@ -608,18 +601,14 @@ def get_available_pallet_numbers(include_number=None):
 
 
 def pallet_exists(pallet_number, exclude_number=None):
-    conn = get_db_connection()
     if exclude_number is None:
-        row = conn.execute(
-            "SELECT 1 FROM pallets WHERE pallet_number = ?",
-            (pallet_number,)
-        ).fetchone()
+        row = execute("SELECT 1 FROM pallets WHERE pallet_number = %s", (pallet_number,), fetchone=True)
     else:
-        row = conn.execute(
-            "SELECT 1 FROM pallets WHERE pallet_number = ? AND pallet_number != ?",
-            (pallet_number, exclude_number)
-        ).fetchone()
-    conn.close()
+        row = execute(
+            "SELECT 1 FROM pallets WHERE pallet_number = %s AND pallet_number != %s",
+            (pallet_number, exclude_number),
+            fetchone=True
+        )
     return row is not None
 
 
@@ -689,47 +678,46 @@ def build_item_rows(existing_items=None, row_count=1):
 
 
 def fetch_pallet(num):
-    conn = get_db_connection()
-    pallet = conn.execute("""
+    pallet = execute("""
         SELECT pallet_number, pallet_name, created_at, created_by
         FROM pallets
-        WHERE pallet_number = ?
-    """, (num,)).fetchone()
+        WHERE pallet_number = %s
+    """, (num,), fetchone=True)
 
-    items = conn.execute("""
+    items = execute("""
         SELECT sku, description, quantity
         FROM pallet_items
-        WHERE pallet_number = ?
+        WHERE pallet_number = %s
         ORDER BY sku
-    """, (num,)).fetchall()
+    """, (num,), fetchall=True)
 
-    conn.close()
     return pallet, items
 
 
 def get_current_audit_run():
-    conn = get_db_connection()
-    row = conn.execute("""
+    return execute("""
         SELECT id, audit_name, created_at, created_by, is_closed
         FROM audit_runs
-        WHERE is_closed = 0
+        WHERE is_closed = FALSE
         ORDER BY id DESC
         LIMIT 1
-    """).fetchone()
-    conn.close()
-    return row
+    """, fetchone=True)
 
 
 def start_new_audit_run():
     conn = get_db_connection()
-    conn.execute("UPDATE audit_runs SET is_closed = 1 WHERE is_closed = 0")
-    audit_name = f"Weekly Audit - {datetime.now().strftime('%d/%m/%Y %H:%M')}"
-    conn.execute("""
-        INSERT INTO audit_runs (audit_name, created_at, created_by, is_closed)
-        VALUES (?, ?, ?, 0)
-    """, (audit_name, now_str(), session["username"]))
-    conn.commit()
-    conn.close()
+    try:
+        cur = conn.cursor()
+        cur.execute("UPDATE audit_runs SET is_closed = TRUE WHERE is_closed = FALSE")
+        audit_name = f"Weekly Audit - {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+        cur.execute("""
+            INSERT INTO audit_runs (audit_name, created_at, created_by, is_closed)
+            VALUES (%s, %s, %s, FALSE)
+        """, (audit_name, now_str(), session["username"]))
+        conn.commit()
+        cur.close()
+    finally:
+        conn.close()
 
 
 def render_label_html(pallet, items):
@@ -801,21 +789,15 @@ def register():
         elif password != confirm_password:
             error_message = "Passwords do not match."
         else:
-            conn = get_db_connection()
-            existing = conn.execute(
-                "SELECT id FROM users WHERE username = ?",
-                (username,)
-            ).fetchone()
+            existing = execute("SELECT id FROM users WHERE username = %s", (username,), fetchone=True)
 
             if existing:
                 error_message = "That username is already taken."
             else:
-                conn.execute("""
+                execute("""
                     INSERT INTO users (username, password_hash, full_name, access_level)
-                    VALUES (?, ?, ?, 1)
-                """, (username, generate_password_hash(password), full_name))
-                conn.commit()
-                conn.close()
+                    VALUES (%s, %s, %s, %s)
+                """, (username, generate_password_hash(password), full_name, 1), commit=True)
                 success_message = "Registration successful. You can now log in."
 
     error_html = f'<div class="warning">{esc(error_message)}</div>' if error_message else ""
@@ -864,13 +846,11 @@ def login():
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
 
-        conn = get_db_connection()
-        user = conn.execute("""
+        user = execute("""
             SELECT id, username, password_hash, full_name, access_level
             FROM users
-            WHERE username = ?
-        """, (username,)).fetchone()
-        conn.close()
+            WHERE username = %s
+        """, (username,), fetchone=True)
 
         if user and check_password_hash(user["password_hash"], password):
             session["user_id"] = user["id"]
@@ -953,13 +933,11 @@ def home():
 @app.route("/pallets")
 @login_required
 def view_all_pallets():
-    conn = get_db_connection()
-    pallets = conn.execute("""
+    pallets = execute("""
         SELECT pallet_number, pallet_name, created_at, created_by
         FROM pallets
         ORDER BY pallet_number ASC
-    """).fetchall()
-    conn.close()
+    """, fetchall=True)
 
     rows = ""
     for pallet in pallets:
@@ -998,7 +976,6 @@ def user_management():
 
     if request.method == "POST":
         action = request.form.get("action", "").strip()
-        conn = get_db_connection()
 
         if action == "add_user":
             full_name = request.form.get("full_name", "").strip()
@@ -1011,10 +988,7 @@ def user_management():
             except ValueError:
                 access_level = 1
 
-            existing = conn.execute(
-                "SELECT id FROM users WHERE username = ?",
-                (username,)
-            ).fetchone()
+            existing = execute("SELECT id FROM users WHERE username = %s", (username,), fetchone=True)
 
             if not full_name or not username or not password:
                 error_message = "Please complete all user fields."
@@ -1025,11 +999,10 @@ def user_management():
             elif existing:
                 error_message = "That username already exists."
             else:
-                conn.execute("""
+                execute("""
                     INSERT INTO users (username, password_hash, full_name, access_level)
-                    VALUES (?, ?, ?, ?)
-                """, (username, generate_password_hash(password), full_name, access_level))
-                conn.commit()
+                    VALUES (%s, %s, %s, %s)
+                """, (username, generate_password_hash(password), full_name, access_level), commit=True)
                 success_message = f"User {username} created."
                 log_audit("USER", f"Created user {username}")
 
@@ -1040,14 +1013,13 @@ def user_management():
             if not new_password or len(new_password) < 6:
                 error_message = "New password must be at least 6 characters."
             else:
-                user_row = conn.execute("SELECT username FROM users WHERE id = ?", (user_id,)).fetchone()
+                user_row = execute("SELECT username FROM users WHERE id = %s", (user_id,), fetchone=True)
                 if user_row:
-                    conn.execute("""
+                    execute("""
                         UPDATE users
-                        SET password_hash = ?
-                        WHERE id = ?
-                    """, (generate_password_hash(new_password), user_id))
-                    conn.commit()
+                        SET password_hash = %s
+                        WHERE id = %s
+                    """, (generate_password_hash(new_password), user_id), commit=True)
                     success_message = f"Password reset for {user_row['username']}."
                     log_audit("USER", f"Reset password for {user_row['username']}")
 
@@ -1063,38 +1035,32 @@ def user_management():
             if access_level not in [1, 2, 3]:
                 error_message = "Invalid access level."
             else:
-                user_row = conn.execute("SELECT username FROM users WHERE id = ?", (user_id,)).fetchone()
+                user_row = execute("SELECT username FROM users WHERE id = %s", (user_id,), fetchone=True)
                 if user_row:
-                    conn.execute("""
+                    execute("""
                         UPDATE users
-                        SET access_level = ?
-                        WHERE id = ?
-                    """, (access_level, user_id))
-                    conn.commit()
+                        SET access_level = %s
+                        WHERE id = %s
+                    """, (access_level, user_id), commit=True)
                     success_message = f"Access level updated for {user_row['username']}."
                     log_audit("USER", f"Changed level for {user_row['username']} to {access_level}")
 
         elif action == "delete_user":
             user_id = request.form.get("user_id", "").strip()
-            user_row = conn.execute("SELECT username FROM users WHERE id = ?", (user_id,)).fetchone()
+            user_row = execute("SELECT username FROM users WHERE id = %s", (user_id,), fetchone=True)
             if user_row:
                 if str(session.get("user_id")) == str(user_id):
                     error_message = "You cannot delete your own user while logged in."
                 else:
-                    conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
-                    conn.commit()
+                    execute("DELETE FROM users WHERE id = %s", (user_id,), commit=True)
                     success_message = f"Deleted user {user_row['username']}."
                     log_audit("USER", f"Deleted user {user_row['username']}")
 
-        conn.close()
-
-    conn = get_db_connection()
-    users = conn.execute("""
+    users = execute("""
         SELECT id, username, full_name, access_level
         FROM users
         ORDER BY username ASC
-    """).fetchall()
-    conn.close()
+    """, fetchall=True)
 
     users_rows = ""
     for user in users:
@@ -1206,7 +1172,6 @@ def products_list():
 
     if request.method == "POST":
         action = request.form.get("action", "").strip()
-        conn = get_db_connection()
 
         if action == "add_product":
             sku = request.form.get("sku", "").strip()
@@ -1215,31 +1180,25 @@ def products_list():
             if not sku or not description:
                 error_message = "Please enter both SKU and description."
             else:
-                conn.execute("""
+                execute("""
                     INSERT INTO products (sku, description)
-                    VALUES (?, ?)
-                    ON CONFLICT(sku) DO UPDATE SET
-                        description = excluded.description
-                """, (sku, description))
-                conn.commit()
+                    VALUES (%s, %s)
+                    ON CONFLICT (sku) DO UPDATE SET
+                        description = EXCLUDED.description
+                """, (sku, description), commit=True)
                 success_message = f"Product {sku} saved."
                 log_audit("PRODUCT", f"Added or updated product {sku}")
 
         elif action == "delete_all_products":
-            conn.execute("DELETE FROM products")
-            conn.commit()
+            execute("DELETE FROM products", commit=True)
             success_message = "All products deleted."
             log_audit("PRODUCT", "Deleted all products")
 
-        conn.close()
-
-    conn = get_db_connection()
-    products = conn.execute("""
+    products = execute("""
         SELECT sku, description
         FROM products
         ORDER BY sku
-    """).fetchall()
-    conn.close()
+    """, fetchall=True)
 
     rows = ""
     for product in products:
@@ -1323,26 +1282,30 @@ def import_products():
                     error_message = "CSV must contain headers: sku, description"
                 else:
                     conn = get_db_connection()
-                    imported_count = 0
+                    try:
+                        cur = conn.cursor()
+                        imported_count = 0
 
-                    for row in reader:
-                        sku = (row.get("sku") or "").strip()
-                        description = (row.get("description") or "").strip()
+                        for row in reader:
+                            sku = (row.get("sku") or "").strip()
+                            description = (row.get("description") or "").strip()
 
-                        if sku and description:
-                            conn.execute("""
-                                INSERT INTO products (sku, description)
-                                VALUES (?, ?)
-                                ON CONFLICT(sku) DO UPDATE SET
-                                    description = excluded.description
-                            """, (sku, description))
-                            imported_count += 1
+                            if sku and description:
+                                cur.execute("""
+                                    INSERT INTO products (sku, description)
+                                    VALUES (%s, %s)
+                                    ON CONFLICT (sku) DO UPDATE SET
+                                        description = EXCLUDED.description
+                                """, (sku, description))
+                                imported_count += 1
 
-                    conn.commit()
-                    conn.close()
+                        conn.commit()
+                        cur.close()
 
-                    success_message = f"Imported or updated {imported_count} products."
-                    log_audit("PRODUCT IMPORT", f"Imported {imported_count} products from CSV")
+                        success_message = f"Imported or updated {imported_count} products."
+                        log_audit("PRODUCT IMPORT", f"Imported {imported_count} products from CSV")
+                    finally:
+                        conn.close()
             except Exception as e:
                 error_message = f"Import failed: {esc(str(e))}"
 
@@ -1406,21 +1369,25 @@ def create_pallet():
             error_message = "Please add at least one valid SKU and quantity."
         else:
             conn = get_db_connection()
-            created_at = now_str()
+            try:
+                cur = conn.cursor()
+                created_at = now_str()
 
-            conn.execute("""
-                INSERT INTO pallets (pallet_number, pallet_name, created_at, created_by)
-                VALUES (?, ?, ?, ?)
-            """, (pallet_number, pallet_name, created_at, session["username"]))
+                cur.execute("""
+                    INSERT INTO pallets (pallet_number, pallet_name, created_at, created_by)
+                    VALUES (%s, %s, %s, %s)
+                """, (pallet_number, pallet_name, created_at, session["username"]))
 
-            for item in items:
-                conn.execute("""
-                    INSERT INTO pallet_items (pallet_number, sku, description, quantity)
-                    VALUES (?, ?, ?, ?)
-                """, (pallet_number, item["sku"], item["description"], item["quantity"]))
+                for item in items:
+                    cur.execute("""
+                        INSERT INTO pallet_items (pallet_number, sku, description, quantity)
+                        VALUES (%s, %s, %s, %s)
+                    """, (pallet_number, item["sku"], item["description"], item["quantity"]))
 
-            conn.commit()
-            conn.close()
+                conn.commit()
+                cur.close()
+            finally:
+                conn.close()
 
             log_audit("CREATE", f"Pallet {pallet_number} created", pallet_number)
             return redirect(url_for("view_pallet", num=pallet_number))
@@ -1590,20 +1557,18 @@ def create_pallet():
 def edit_pallet(num):
     product_map = get_product_map()
 
-    conn = get_db_connection()
-    pallet = conn.execute("""
+    pallet = execute("""
         SELECT pallet_number, pallet_name, created_at, created_by
         FROM pallets
-        WHERE pallet_number = ?
-    """, (num,)).fetchone()
+        WHERE pallet_number = %s
+    """, (num,), fetchone=True)
 
-    items_rows = conn.execute("""
+    items_rows = execute("""
         SELECT sku, description, quantity
         FROM pallet_items
-        WHERE pallet_number = ?
+        WHERE pallet_number = %s
         ORDER BY sku
-    """, (num,)).fetchall()
-    conn.close()
+    """, (num,), fetchall=True)
 
     if not pallet:
         return render_page("""
@@ -1641,36 +1606,40 @@ def edit_pallet(num):
             error_message = "Please add at least one valid SKU and quantity."
         else:
             conn = get_db_connection()
+            try:
+                cur = conn.cursor()
 
-            if new_pallet_number != num:
-                conn.execute("""
-                    UPDATE pallets
-                    SET pallet_number = ?, pallet_name = ?
-                    WHERE pallet_number = ?
-                """, (new_pallet_number, pallet_name, num))
+                if new_pallet_number != num:
+                    cur.execute("""
+                        UPDATE pallets
+                        SET pallet_number = %s, pallet_name = %s
+                        WHERE pallet_number = %s
+                    """, (new_pallet_number, pallet_name, num))
 
-                conn.execute("""
-                    UPDATE pallet_items
-                    SET pallet_number = ?
-                    WHERE pallet_number = ?
-                """, (new_pallet_number, num))
-            else:
-                conn.execute("""
-                    UPDATE pallets
-                    SET pallet_name = ?
-                    WHERE pallet_number = ?
-                """, (pallet_name, num))
+                    cur.execute("""
+                        UPDATE pallet_items
+                        SET pallet_number = %s
+                        WHERE pallet_number = %s
+                    """, (new_pallet_number, num))
+                else:
+                    cur.execute("""
+                        UPDATE pallets
+                        SET pallet_name = %s
+                        WHERE pallet_number = %s
+                    """, (pallet_name, num))
 
-            conn.execute("DELETE FROM pallet_items WHERE pallet_number = ?", (new_pallet_number,))
+                cur.execute("DELETE FROM pallet_items WHERE pallet_number = %s", (new_pallet_number,))
 
-            for item in items:
-                conn.execute("""
-                    INSERT INTO pallet_items (pallet_number, sku, description, quantity)
-                    VALUES (?, ?, ?, ?)
-                """, (new_pallet_number, item["sku"], item["description"], item["quantity"]))
+                for item in items:
+                    cur.execute("""
+                        INSERT INTO pallet_items (pallet_number, sku, description, quantity)
+                        VALUES (%s, %s, %s, %s)
+                    """, (new_pallet_number, item["sku"], item["description"], item["quantity"]))
 
-            conn.commit()
-            conn.close()
+                conn.commit()
+                cur.close()
+            finally:
+                conn.close()
 
             log_audit("EDIT", f"Pallet {num} updated", new_pallet_number)
             return redirect(url_for("view_pallet", num=new_pallet_number))
@@ -1861,19 +1830,23 @@ def duplicate_pallet(num):
             error_message = "Please enter a pallet name."
         else:
             conn = get_db_connection()
-            conn.execute("""
-                INSERT INTO pallets (pallet_number, pallet_name, created_at, created_by)
-                VALUES (?, ?, ?, ?)
-            """, (new_pallet_number, pallet_name, now_str(), session["username"]))
+            try:
+                cur = conn.cursor()
+                cur.execute("""
+                    INSERT INTO pallets (pallet_number, pallet_name, created_at, created_by)
+                    VALUES (%s, %s, %s, %s)
+                """, (new_pallet_number, pallet_name, now_str(), session["username"]))
 
-            for item in items:
-                conn.execute("""
-                    INSERT INTO pallet_items (pallet_number, sku, description, quantity)
-                    VALUES (?, ?, ?, ?)
-                """, (new_pallet_number, item["sku"], item["description"], item["quantity"]))
+                for item in items:
+                    cur.execute("""
+                        INSERT INTO pallet_items (pallet_number, sku, description, quantity)
+                        VALUES (%s, %s, %s, %s)
+                    """, (new_pallet_number, item["sku"], item["description"], item["quantity"]))
 
-            conn.commit()
-            conn.close()
+                conn.commit()
+                cur.close()
+            finally:
+                conn.close()
 
             log_audit("DUPLICATE", f"Pallet {num} duplicated to {new_pallet_number}", new_pallet_number)
             return redirect(url_for("view_pallet", num=new_pallet_number))
@@ -1926,12 +1899,17 @@ def duplicate_pallet(num):
 @level_required(1)
 def delete_pallet(num):
     pallet, _ = fetch_pallet(num)
+
     conn = get_db_connection()
-    conn.execute("DELETE FROM pallet_items WHERE pallet_number = ?", (num,))
-    conn.execute("DELETE FROM audit_run_items WHERE pallet_number = ?", (num,))
-    conn.execute("DELETE FROM pallets WHERE pallet_number = ?", (num,))
-    conn.commit()
-    conn.close()
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM pallet_items WHERE pallet_number = %s", (num,))
+        cur.execute("DELETE FROM audit_run_items WHERE pallet_number = %s", (num,))
+        cur.execute("DELETE FROM pallets WHERE pallet_number = %s", (num,))
+        conn.commit()
+        cur.close()
+    finally:
+        conn.close()
 
     if pallet:
         log_audit("DELETE", f"Pallet {num} deleted", num)
@@ -1943,30 +1921,26 @@ def delete_pallet(num):
 @login_required
 @level_required(1)
 def view_pallet(num):
-    conn = get_db_connection()
-
-    pallet = conn.execute("""
+    pallet = execute("""
         SELECT pallet_number, pallet_name, created_at, created_by
         FROM pallets
-        WHERE pallet_number = ?
-    """, (num,)).fetchone()
+        WHERE pallet_number = %s
+    """, (num,), fetchone=True)
 
-    items = conn.execute("""
+    items = execute("""
         SELECT sku, description, quantity
         FROM pallet_items
-        WHERE pallet_number = ?
+        WHERE pallet_number = %s
         ORDER BY sku
-    """, (num,)).fetchall()
+    """, (num,), fetchall=True)
 
-    audit_rows = conn.execute("""
+    audit_rows = execute("""
         SELECT action_type, username, details, created_at
         FROM pallet_audit
-        WHERE pallet_number = ?
+        WHERE pallet_number = %s
         ORDER BY id DESC
         LIMIT 12
-    """, (num,)).fetchall()
-
-    conn.close()
+    """, (num,), fetchall=True)
 
     if not pallet:
         return render_page("""
@@ -2063,23 +2037,26 @@ def pallet_audit():
             current_audit = get_current_audit_run()
 
         if action == "confirm":
-            conn = get_db_connection()
-            conn.execute("""
-                INSERT OR IGNORE INTO audit_run_items (audit_run_id, pallet_number, confirmed_at, confirmed_by)
-                VALUES (?, ?, ?, ?)
-            """, (current_audit["id"], pallet_number, now_str(), session["username"]))
-            conn.commit()
-            conn.close()
+            execute("""
+                INSERT INTO audit_run_items (audit_run_id, pallet_number, confirmed_at, confirmed_by)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (audit_run_id, pallet_number) DO NOTHING
+            """, (current_audit["id"], pallet_number, now_str(), session["username"]), commit=True)
             log_audit("AUDIT", f"Pallet {pallet_number} confirmed in audit {current_audit['audit_name']}", pallet_number)
 
         elif action == "delete":
             pallet, _ = fetch_pallet(pallet_number)
             conn = get_db_connection()
-            conn.execute("DELETE FROM pallet_items WHERE pallet_number = ?", (pallet_number,))
-            conn.execute("DELETE FROM audit_run_items WHERE pallet_number = ?", (pallet_number,))
-            conn.execute("DELETE FROM pallets WHERE pallet_number = ?", (pallet_number,))
-            conn.commit()
-            conn.close()
+            try:
+                cur = conn.cursor()
+                cur.execute("DELETE FROM pallet_items WHERE pallet_number = %s", (pallet_number,))
+                cur.execute("DELETE FROM audit_run_items WHERE pallet_number = %s", (pallet_number,))
+                cur.execute("DELETE FROM pallets WHERE pallet_number = %s", (pallet_number,))
+                conn.commit()
+                cur.close()
+            finally:
+                conn.close()
+
             if pallet:
                 log_audit("AUDIT DELETE", f"Pallet {pallet_number} removed during audit", pallet_number)
 
@@ -2091,24 +2068,22 @@ def pallet_audit():
         start_new_audit_run()
         current_audit = get_current_audit_run()
 
-    conn = get_db_connection()
-    pallets = conn.execute("""
+    pallets = execute("""
         SELECT p.pallet_number, p.pallet_name, p.created_at
         FROM pallets p
         LEFT JOIN audit_run_items ari
             ON ari.pallet_number = p.pallet_number
-            AND ari.audit_run_id = ?
+            AND ari.audit_run_id = %s
         WHERE ari.id IS NULL
         ORDER BY p.pallet_number ASC
-    """, (current_audit["id"],)).fetchall()
+    """, (current_audit["id"],), fetchall=True)
 
-    recent_audits = conn.execute("""
+    recent_audits = execute("""
         SELECT id, audit_name, created_at, created_by, is_closed
         FROM audit_runs
         ORDER BY id DESC
         LIMIT 6
-    """).fetchall()
-    conn.close()
+    """, fetchall=True)
 
     if pallets:
         rows = ""
@@ -2138,7 +2113,7 @@ def pallet_audit():
 
     audit_history_rows = ""
     for audit in recent_audits:
-        status_text = "Open" if audit["is_closed"] == 0 else "Closed"
+        status_text = "Open" if audit["is_closed"] is False else "Closed"
         audit_history_rows += f"""
         <tr>
             <td>{esc(audit['audit_name'])}</td>
@@ -2186,15 +2161,13 @@ def search_sku():
     results_html = ""
 
     if sku_value:
-        conn = get_db_connection()
-        matches = conn.execute("""
+        matches = execute("""
             SELECT p.pallet_number, p.pallet_name, p.created_at, p.created_by, i.sku, i.description, i.quantity
             FROM pallet_items i
             JOIN pallets p ON p.pallet_number = i.pallet_number
-            WHERE i.sku = ?
+            WHERE i.sku = %s
             ORDER BY p.pallet_number ASC
-        """, (sku_value,)).fetchall()
-        conn.close()
+        """, (sku_value,), fetchall=True)
 
         if matches:
             result_rows = ""
@@ -2284,23 +2257,29 @@ def label(num):
 @level_required(2)
 def print_all_labels():
     conn = get_db_connection()
-    pallets = conn.execute("""
-        SELECT pallet_number, pallet_name, created_at, created_by
-        FROM pallets
-        ORDER BY pallet_number ASC
-    """).fetchall()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT pallet_number, pallet_name, created_at, created_by
+            FROM pallets
+            ORDER BY pallet_number ASC
+        """)
+        pallets = cur.fetchall()
 
-    content_labels = ""
-    for pallet in pallets:
-        items = conn.execute("""
-            SELECT sku, description, quantity
-            FROM pallet_items
-            WHERE pallet_number = ?
-            ORDER BY sku
-        """, (pallet["pallet_number"],)).fetchall()
-        content_labels += render_label_html(pallet, items)
+        content_labels = ""
+        for pallet in pallets:
+            cur.execute("""
+                SELECT sku, description, quantity
+                FROM pallet_items
+                WHERE pallet_number = %s
+                ORDER BY sku
+            """, (pallet["pallet_number"],))
+            items = cur.fetchall()
+            content_labels += render_label_html(pallet, items)
 
-    conn.close()
+        cur.close()
+    finally:
+        conn.close()
 
     content = f"""
     <div class="no-print label-toolbar">
