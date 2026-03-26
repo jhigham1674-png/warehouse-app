@@ -880,12 +880,6 @@ def login():
                 <button class="btn" type="submit">Login</button>
                 <a class="btn secondary" href="{url_for('register')}">Register</a>
             </form>
-
-            <div class="notice" style="margin-top:16px;">
-                Demo login:<br>
-                <strong>admin</strong> / <strong>admin123</strong> (Level 3)<br>
-                <strong>warehouse</strong> / <strong>warehouse123</strong> (Level 1)
-            </div>
         </div>
     </div>
     """
@@ -1274,38 +1268,69 @@ def import_products():
             error_message = "Please choose a CSV file."
         else:
             try:
-                content = uploaded.read().decode("utf-8-sig")
-                reader = csv.DictReader(io.StringIO(content))
+                decoded_stream = io.StringIO(uploaded.stream.read().decode("utf-8-sig", errors="replace"))
+                reader = csv.DictReader(decoded_stream)
 
                 required = {"sku", "description"}
-                if not reader.fieldnames or not required.issubset(set(reader.fieldnames)):
+                fieldnames = {name.strip().lower() for name in (reader.fieldnames or [])}
+
+                if not reader.fieldnames or not required.issubset(fieldnames):
                     error_message = "CSV must contain headers: sku, description"
                 else:
                     conn = get_db_connection()
                     try:
                         cur = conn.cursor()
                         imported_count = 0
+                        batch = []
+                        batch_size = 200
 
                         for row in reader:
-                            sku = (row.get("sku") or "").strip()
-                            description = (row.get("description") or "").strip()
+                            normalised = {(k or "").strip().lower(): (v or "").strip() for k, v in row.items()}
+                            sku = normalised.get("sku", "")
+                            description = normalised.get("description", "")
 
-                            if sku and description:
-                                cur.execute("""
+                            if not sku or not description:
+                                continue
+
+                            batch.append((sku, description))
+
+                            if len(batch) >= batch_size:
+                                psycopg2.extras.execute_batch(
+                                    cur,
+                                    """
                                     INSERT INTO products (sku, description)
                                     VALUES (%s, %s)
                                     ON CONFLICT (sku) DO UPDATE SET
                                         description = EXCLUDED.description
-                                """, (sku, description))
-                                imported_count += 1
+                                    """,
+                                    batch,
+                                    page_size=batch_size
+                                )
+                                conn.commit()
+                                imported_count += len(batch)
+                                batch = []
 
-                        conn.commit()
+                        if batch:
+                            psycopg2.extras.execute_batch(
+                                cur,
+                                """
+                                INSERT INTO products (sku, description)
+                                VALUES (%s, %s)
+                                ON CONFLICT (sku) DO UPDATE SET
+                                    description = EXCLUDED.description
+                                """,
+                                batch,
+                                page_size=batch_size
+                            )
+                            conn.commit()
+                            imported_count += len(batch)
+
                         cur.close()
-
                         success_message = f"Imported or updated {imported_count} products."
                         log_audit("PRODUCT IMPORT", f"Imported {imported_count} products from CSV")
                     finally:
                         conn.close()
+
             except Exception as e:
                 error_message = f"Import failed: {esc(str(e))}"
 
@@ -2292,6 +2317,7 @@ def print_all_labels():
     </div>
     """
     return render_page(content, "Print All Labels")
+
 
 try:
     init_db()
